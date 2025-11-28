@@ -3,3 +3,4 @@ data/*.csv
 *.csv
 *.parquet
 venv/
+cropped/
