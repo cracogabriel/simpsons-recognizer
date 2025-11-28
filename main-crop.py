@@ -47,39 +47,65 @@ HSV_BINS = (8, 8, 8)
 
 def crop_simpson_face(img):
     """
-    Detecta face dos Simpsons via segmentação de pele amarela.
+    Versão tunada do crop usando segmentação de pele amarela,
+    convex hull, filtro de proporções e padding inteligente.
     """
+    # Converte para HSV
     hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
 
-    # Pele amarela típica
-    lower_yellow = np.array([20, 80, 80])
-    upper_yellow = np.array([35, 255, 255])
+    # Faixas ampliadas de pele amarela simpsonizada
+    lower_yellow = np.array([15, 60, 60])   # mais permissivo
+    upper_yellow = np.array([40, 255, 255])
 
     mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-    # Morfologia (limpa ruídos)
-    kernel = np.ones((7, 7), np.uint8)
+    # Morfologia para limpar ruídos
+    kernel = np.ones((9, 9), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
+    # Encontra contornos
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
 
+    # Pega maior contorno
     cnt = max(cnts, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(cnt)
 
-    if w < 40 or h < 40:
+    # Rejeita contornos muito pequenos
+    if cv2.contourArea(cnt) < 500:
         return None
 
-    # Expande bounding box
-    pad = int(0.20 * max(w, h))
-    x = max(0, x - pad)
-    y = max(0, y - pad)
-    w = min(img.shape[1] - x, w + 2 * pad)
-    h = min(img.shape[0] - y, h + 2 * pad)
+    # Usa convex hull para aproximar melhor
+    hull = cv2.convexHull(cnt)
 
-    return img[y:y+h, x:x+w]
+    x, y, w, h = cv2.boundingRect(hull)
+
+    # Filtro por proporção da cabeça:
+    # Cabeças dos Simpsons são geralmente mais altas do que largas.
+    ratio = h / (w + 1e-6)
+    if ratio < 0.9 or ratio > 3.0:  # ignora objetos largos demais ou muito finos
+        return None
+
+    # Reduz um pouco o bounding box horizontal (menos corpo)
+    crop_w = int(w)
+    crop_x = x + (w - crop_w) // 2
+
+    # Aumenta verticalmente (inclui cabelo/olhos)
+    pad_h = int(h * 0.25)
+    crop_y = max(0, y - pad_h)
+    crop_h = min(img.shape[0] - crop_y, h + pad_h * 2)
+
+    crop_x = max(0, crop_x)
+    crop_w = min(img.shape[1] - crop_x, crop_w)
+
+    cropped = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+
+    # Rejeita crops muito pequenos
+    if cropped.shape[0] < 40 or cropped.shape[1] < 40:
+        return None
+
+    return cropped
 
 # ============================================================
 # CRIAÇÃO DO NOVO DATASET (CROPPED)
