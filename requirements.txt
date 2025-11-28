@@ -3,3 +3,5 @@ opencv-python
 scikit-image
 scikit-learn
 imblearn
+matplotlib
+seaborn

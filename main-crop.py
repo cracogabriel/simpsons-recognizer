@@ -14,11 +14,11 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from imblearn.over_sampling import SMOTE
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
 
-# ============================================================
-# CONFIGURAÇÕES
-# ============================================================
-
+# configurações gerais do pipeline
 RAW_TRAIN = "dataset/train"
 RAW_VALID = "dataset/valid"
 
@@ -27,308 +27,311 @@ CROPPED_VALID = "cropped/valid"
 
 IMG_SIZE = (128, 128)
 RANDOM_STATE = 42
-PCA_VARIANCE = 0.90
+PCA_VARIANCE = 0.60
 
-# Melhor HOG
+# parâmetros otimizados para extração de características de faces dos simpsons
 HOG_PIXELS = (8, 8)
 HOG_CELLS = (2, 2)
 HOG_ORIENT = 9
 
-# LBP
 LBP_P = 24
 LBP_R = 3
 LBP_BINS = LBP_P + 2
 
 HSV_BINS = (8, 8, 8)
 
-# ============================================================
-# DETECÇÃO DE FACE (SIMPOSNIZED SKIN DETECTOR)
-# ============================================================
-
+# detecta e recorta faces dos simpsons usando detecção de pele amarela característica
 def crop_simpson_face(img):
-    """
-    Versão tunada do crop usando segmentação de pele amarela,
-    convex hull, filtro de proporções e padding inteligente.
-    """
-    # Converte para HSV
-    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+  hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
 
-    # Faixas ampliadas de pele amarela simpsonizada
-    lower_yellow = np.array([15, 60, 60])   # mais permissivo
-    upper_yellow = np.array([40, 255, 255])
+  # faixa de cor da pele amarela dos personagens
+  lower_yellow = np.array([15, 60, 60])
+  upper_yellow = np.array([40, 255, 255])
 
-    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+  mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-    # Morfologia para limpar ruídos
-    kernel = np.ones((9, 9), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+  # remove ruídos da máscara
+  kernel = np.ones((9, 9), np.uint8)
+  mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+  mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    # Encontra contornos
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
+  cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+  if not cnts:
+    return None
 
-    # Pega maior contorno
-    cnt = max(cnts, key=cv2.contourArea)
+  cnt = max(cnts, key=cv2.contourArea)
 
-    # Rejeita contornos muito pequenos
-    if cv2.contourArea(cnt) < 500:
-        return None
+  if cv2.contourArea(cnt) < 500:
+    return None
 
-    # Usa convex hull para aproximar melhor
-    hull = cv2.convexHull(cnt)
+  hull = cv2.convexHull(cnt)
+  x, y, w, h = cv2.boundingRect(hull)
 
-    x, y, w, h = cv2.boundingRect(hull)
+  # valida proporção típica de cabeças dos simpsons (mais altas que largas)
+  ratio = h / (w + 1e-6)
+  if ratio < 0.9 or ratio > 3.0:
+    return None
 
-    # Filtro por proporção da cabeça:
-    # Cabeças dos Simpsons são geralmente mais altas do que largas.
-    ratio = h / (w + 1e-6)
-    if ratio < 0.9 or ratio > 3.0:  # ignora objetos largos demais ou muito finos
-        return None
+  crop_w = int(w)
+  crop_x = x + (w - crop_w) // 2
 
-    # Reduz um pouco o bounding box horizontal (menos corpo)
-    crop_w = int(w)
-    crop_x = x + (w - crop_w) // 2
+  # expande verticalmente para incluir cabelo e olhos
+  pad_h = int(h * 0.25)
+  crop_y = max(0, y - pad_h)
+  crop_h = min(img.shape[0] - crop_y, h + pad_h * 2)
 
-    # Aumenta verticalmente (inclui cabelo/olhos)
-    pad_h = int(h * 0.25)
-    crop_y = max(0, y - pad_h)
-    crop_h = min(img.shape[0] - crop_y, h + pad_h * 2)
+  crop_x = max(0, crop_x)
+  crop_w = min(img.shape[1] - crop_x, crop_w)
 
-    crop_x = max(0, crop_x)
-    crop_w = min(img.shape[1] - crop_x, crop_w)
+  cropped = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
 
-    cropped = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+  if cropped.shape[0] < 40 or cropped.shape[1] < 40:
+    return None
 
-    # Rejeita crops muito pequenos
-    if cropped.shape[0] < 40 or cropped.shape[1] < 40:
-        return None
+  return cropped
 
-    return cropped
-
-# ============================================================
-# CRIAÇÃO DO NOVO DATASET (CROPPED)
-# ============================================================
-
+# processa todas as imagens do dataset original e salva apenas as faces recortadas
 def generate_cropped_dataset(src_folder, dst_folder):
-    os.makedirs(dst_folder, exist_ok=True)
+  os.makedirs(dst_folder, exist_ok=True)
 
-    for fname in sorted(os.listdir(src_folder)):
-        if not fname.lower().endswith(".bmp"):
-            continue
+  for fname in sorted(os.listdir(src_folder)):
+    if not fname.lower().endswith(".bmp"):
+      continue
 
-        img_path = os.path.join(src_folder, fname)
-        img = cv2.imread(img_path)
+    img_path = os.path.join(src_folder, fname)
+    img = cv2.imread(img_path)
 
-        if img is None:
-            continue
+    if img is None:
+      continue
 
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        cropped = crop_simpson_face(img)
-        if cropped is None:
-            continue
+    cropped = crop_simpson_face(img)
+    if cropped is None:
+      continue
 
-        out_path = os.path.join(dst_folder, fname)
-        cropped_bgr = cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(out_path, cropped_bgr)
+    out_path = os.path.join(dst_folder, fname)
+    cropped_bgr = cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(out_path, cropped_bgr)
 
-
-# ============================================================
-# EXTRAÇÃO DO RÓTULO
-# ============================================================
-
+# extrai o nome do personagem do nome do arquivo
 def extract_label(fname: str):
-    base = os.path.basename(fname).lower()
-    m = re.match(r"([a-z]+)", base)
-    if m:
-        return m.group(1)
-    return base.split(".")[0]
+  base = os.path.basename(fname).lower()
+  m = re.match(r"([a-z]+)", base)
+  if m:
+    return m.group(1)
+  return base.split(".")[0]
 
-
-# ============================================================
-# AUGMENTATION
-# ============================================================
-
+# aplica transformações para aumentar o dataset de treino
 def augment_image(img):
-    aug = []
+  aug = []
 
-    aug.append(cv2.flip(img, 1))
+  aug.append(cv2.flip(img, 1))
 
-    M = cv2.getRotationMatrix2D((img.shape[1]//2, img.shape[0]//2), 10, 1.0)
-    aug.append(cv2.warpAffine(img, M, IMG_SIZE))
+  M = cv2.getRotationMatrix2D((img.shape[1]//2, img.shape[0]//2), 10, 1.0)
+  aug.append(cv2.warpAffine(img, M, IMG_SIZE))
 
-    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.25, 0, 255)
-    aug.append(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB))
+  hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+  hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.25, 0, 255)
+  aug.append(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB))
 
-    return aug
-
-
-# ============================================================
-# LOADING DAS IMAGENS
-# ============================================================
+  return aug
 
 def load_images_and_labels(folder, do_augment=False):
-    imgs, labels = [], []
+  imgs, labels = [], []
 
-    for fname in sorted(os.listdir(folder)):
-        if not fname.lower().endswith(".bmp"):
-            continue
+  for fname in sorted(os.listdir(folder)):
+    if not fname.lower().endswith(".bmp"):
+      continue
 
-        path = os.path.join(folder, fname)
-        img = cv2.imread(path)
+    path = os.path.join(folder, fname)
+    img = cv2.imread(path)
 
-        if img is None:
-            continue
+    if img is None:
+      continue
 
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, IMG_SIZE)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, IMG_SIZE)
 
-        label = extract_label(fname)
+    label = extract_label(fname)
 
-        imgs.append(img)
+    imgs.append(img)
+    labels.append(label)
+
+    if do_augment:
+      for aug in augment_image(img):
+        imgs.append(aug)
         labels.append(label)
 
-        if do_augment:
-            for aug in augment_image(img):
-                imgs.append(aug)
-                labels.append(label)
+  return np.array(imgs), np.array(labels)
 
-    return np.array(imgs), np.array(labels)
-
-
-# ============================================================
-# FEATURES: HOG / LBP / COLOR
-# ============================================================
-
+# extrai características de gradientes e bordas usando histogram of oriented gradients
 def extract_hog(imgs):
-    feats = []
-    for img in imgs:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        feat = hog(gray,
-                   orientations=HOG_ORIENT,
-                   pixels_per_cell=HOG_PIXELS,
-                   cells_per_block=HOG_CELLS,
-                   block_norm="L2-Hys",
-                   feature_vector=True)
-        feats.append(feat)
-    return np.array(feats)
+  feats = []
+  for img in imgs:
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    feat = hog(gray,
+           orientations=HOG_ORIENT,
+           pixels_per_cell=HOG_PIXELS,
+           cells_per_block=HOG_CELLS,
+           block_norm="L2-Hys",
+           feature_vector=True)
+    feats.append(feat)
+  return np.array(feats)
 
-
+# extrai características de textura usando local binary patterns
 def extract_lbp(imgs):
-    feats = []
-    for img in imgs:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        lbp = local_binary_pattern(gray, P=LBP_P, R=LBP_R, method="uniform")
-        hist, _ = np.histogram(lbp.ravel(), bins=LBP_BINS, range=(0, LBP_BINS))
-        hist = hist / (hist.sum() + 1e-6)
-        feats.append(hist)
-    return np.array(feats)
+  feats = []
+  for img in imgs:
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    lbp = local_binary_pattern(gray, P=LBP_P, R=LBP_R, method="uniform")
+    hist, _ = np.histogram(lbp.ravel(), bins=LBP_BINS, range=(0, LBP_BINS))
+    hist = hist / (hist.sum() + 1e-6)
+    feats.append(hist)
+  return np.array(feats)
 
-
+# extrai histograma de cores no espaço hsv
 def extract_color(imgs):
-    feats = []
-    for img in imgs:
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        hist = cv2.calcHist([hsv], [0,1,2], None, HSV_BINS,
-                            [0,180, 0,256, 0,256]).flatten()
-        hist = hist / (hist.sum() + 1e-6)
-        feats.append(hist)
-    return np.array(feats)
+  feats = []
+  for img in imgs:
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    hist = cv2.calcHist([hsv], [0,1,2], None, HSV_BINS,
+              [0,180, 0,256, 0,256]).flatten()
+    hist = hist / (hist.sum() + 1e-6)
+    feats.append(hist)
+  return np.array(feats)
 
-
-# ============================================================
-# CLASSIFICADORES
-# ============================================================
-
+# define ensemble de classificadores com diferentes parâmetros para votação majoritária
 def build_classifiers():
-    return [
-        ("knn_3", KNeighborsClassifier(3)),
-        ("knn_5", KNeighborsClassifier(5)),
-        ("svm_linear", SVC(kernel="linear", C=1)),
-        ("svm_rbf", SVC(kernel="rbf", C=5, gamma=0.01)),
-        ("rf_100", RandomForestClassifier(100)),
-        ("dt_10", DecisionTreeClassifier(max_depth=10)),
-    ]
+  return [
+    ("knn_3", KNeighborsClassifier(3)),
+    ("knn_5", KNeighborsClassifier(5)),
+    ("knn_7", KNeighborsClassifier(7)),
+    ("knn_9", KNeighborsClassifier(9)),
 
+    ("svm_linear", SVC(kernel="linear", C=1)),
+    ("svm_linear_soft", SVC(kernel="linear", C=0.5)),
+    ("svm_rbf", SVC(kernel="rbf", C=5, gamma=0.01)),
+    ("svm_rbf_soft", SVC(kernel="rbf", C=1, gamma=0.02)),
+    ("svm_poly_2", SVC(kernel="poly", degree=2, C=1, gamma="scale")),
+    ("svm_poly_3", SVC(kernel="poly", degree=3, C=1, gamma="scale")),
 
+    ("rf_50", RandomForestClassifier(n_estimators=50, random_state=42)),
+    ("rf_100", RandomForestClassifier(n_estimators=100, random_state=42)),
+    ("rf_200", RandomForestClassifier(n_estimators=200, random_state=42)),
+
+    ("dt_10", DecisionTreeClassifier(max_depth=10, random_state=42)),
+    ("dt_20", DecisionTreeClassifier(max_depth=20, random_state=42)),
+    ("dt_none", DecisionTreeClassifier(random_state=42)),  
+  ]
+
+# combina predições de múltiplos classificadores por votação
 def majority_vote(preds):
-    preds = np.array(preds)
-    final = []
-    for i in range(preds.shape[1]):
-        c = Counter(preds[:, i])
-        final.append(c.most_common(1)[0][0])
-    return np.array(final)
-
-
-# ============================================================
-# MAIN
-# ============================================================
+  preds = np.array(preds)
+  final = []
+  for i in range(preds.shape[1]):
+    c = Counter(preds[:, i])
+    final.append(c.most_common(1)[0][0])
+  return np.array(final)
 
 def main():
-    warnings.filterwarnings("ignore")
+  warnings.filterwarnings("ignore")
 
-    print("\n=== GERANDO NOVO DATASET (CROPPED) ===")
+  print("\n=== GERANDO NOVO DATASET (CROPPED) ===")
 
-    generate_cropped_dataset(RAW_TRAIN, CROPPED_TRAIN)
-    generate_cropped_dataset(RAW_VALID, CROPPED_VALID)
+  generate_cropped_dataset(RAW_TRAIN, CROPPED_TRAIN)
+  generate_cropped_dataset(RAW_VALID, CROPPED_VALID)
 
-    print("Dataset de faces gerado com sucesso.\n")
+  print("Dataset de faces gerado com sucesso.\n")
 
-    print("=== Carregando imagens ===")
-    X_train_img, y_train = load_images_and_labels(CROPPED_TRAIN, do_augment=True)
-    X_valid_img, y_valid = load_images_and_labels(CROPPED_VALID)
+  print("=== Carregando imagens ===")
+  X_train_img, y_train = load_images_and_labels(CROPPED_TRAIN, do_augment=True)
+  X_valid_img, y_valid = load_images_and_labels(CROPPED_VALID)
 
-    print(f"Train size após augment: {len(X_train_img)}")
+  print(f"Train size após augment: {len(X_train_img)}")
 
-    le = LabelEncoder()
-    y_train_enc = le.fit_transform(y_train)
-    y_valid_enc = le.transform(y_valid)
+  le = LabelEncoder()
+  y_train_enc = le.fit_transform(y_train)
+  y_valid_enc = le.transform(y_valid)
 
-    print("\n=== Extraindo features ===")
-    X_train = np.hstack([
-        extract_color(X_train_img),
-        extract_hog(X_train_img),
-        extract_lbp(X_train_img)
-    ])
-    X_valid = np.hstack([
-        extract_color(X_valid_img),
-        extract_hog(X_valid_img),
-        extract_lbp(X_valid_img)
-    ])
+  print("\n=== Extraindo features ===")
+  # combina características de cor, forma e textura para representação completa
+  X_train = np.hstack([
+    extract_color(X_train_img),
+    extract_hog(X_train_img),
+    extract_lbp(X_train_img)
+  ])
+  X_valid = np.hstack([
+    extract_color(X_valid_img),
+    extract_hog(X_valid_img),
+    extract_lbp(X_valid_img)
+  ])
 
-    print("Escalonando...")
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_valid = scaler.transform(X_valid)
+  print("Escalonando...")
+  scaler = StandardScaler()
+  X_train = scaler.fit_transform(X_train)
+  X_valid = scaler.transform(X_valid)
 
-    print("Aplicando PCA...")
-    pca = PCA(n_components=PCA_VARIANCE)
-    X_train = pca.fit_transform(X_train)
-    X_valid = pca.transform(X_valid)
+  print("Aplicando PCA...")
+  pca = PCA(n_components=PCA_VARIANCE)
+  X_train = pca.fit_transform(X_train)
+  X_valid = pca.transform(X_valid)
 
-    print("Balanceando SMOTE...")
-    sm = SMOTE(random_state=RANDOM_STATE)
-    X_train, y_train_enc = sm.fit_resample(X_train, y_train_enc)
+  print("Balanceando SMOTE...")
+  # equilibra classes desbalanceadas gerando amostras sintéticas
+  sm = SMOTE(random_state=RANDOM_STATE)
+  X_train, y_train_enc = sm.fit_resample(X_train, y_train_enc)
 
-    print("\n=== Treinando classificadores ===")
-    preds = []
-    clfs = build_classifiers()
+  print("\n=== Treinando classificadores ===")
+  preds = []
+  clfs = build_classifiers()
 
-    for name, clf in clfs:
-        print("Treinando:", name)
-        clf.fit(X_train, y_train_enc)
-        preds.append(clf.predict(X_valid))
+  for name, clf in clfs:
+    print("Treinando:", name)
+    clf.fit(X_train, y_train_enc)
+    preds.append(clf.predict(X_valid))
 
-    final_pred = majority_vote(preds)
+  final_pred = majority_vote(preds)
 
-    print("\n=== RESULTADOS FINAIS ===")
-    print("Acurácia:", accuracy_score(y_valid_enc, final_pred))
-    print("\nClassification Report:")
-    print(classification_report(y_valid_enc, final_pred, target_names=le.classes_))
+  print("\n=== RESULTADOS FINAIS ===")
+  print("Acurácia:", accuracy_score(y_valid_enc, final_pred))
+  print("\nClassification Report:")
+  print(classification_report(y_valid_enc, final_pred, target_names=le.classes_))
+
+  os.makedirs("report", exist_ok=True)
+
+  accs = []
+  names = []
+
+  for (name, clf), pred in zip(clfs, preds):
+    acc = accuracy_score(y_valid_enc, pred)
+    accs.append(acc)
+    names.append(name)
+
+  plt.figure(figsize=(14, 6))
+  plt.bar(names, accs)
+  plt.xticks(rotation=45, ha="right")
+  plt.ylabel("Acurácia")
+  plt.title("Acurácia por Classificador")
+  plt.tight_layout()
+  plt.savefig("report/accuracy_per_model.png", dpi=300)
+  plt.close()
+
+  cm = confusion_matrix(y_valid_enc, final_pred)
+  plt.figure(figsize=(10, 8))
+  sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+              xticklabels=le.classes_, yticklabels=le.classes_)
+  plt.title("Matriz de Confusão - Ensemble Final")
+  plt.xlabel("Predito")
+  plt.ylabel("Real")
+  plt.tight_layout()
+  plt.savefig("report/confusion_matrix.png", dpi=300)
+  plt.close()
+
+  print("\nGráficos salvos em: report/")
+  print(" - accuracy_per_model.png")
+  print(" - confusion_matrix.png")
 
 
 if __name__ == "__main__":
-    main()
+  main()
